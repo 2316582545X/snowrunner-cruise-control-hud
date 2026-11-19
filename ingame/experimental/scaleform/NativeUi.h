@@ -1,0 +1,218 @@
+#pragma once
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include <initializer_list>
+
+namespace nativeui {
+// Exact observed ABI of the supported SnowRunner EXE, not a generic SDK type.
+struct Value {
+    // Intrusive managed-value links: a registered Value must never move.
+    uint64_t links[2] = {UINT64_MAX, UINT64_MAX};
+    uintptr_t interfacePointer = 0;
+    uint32_t type = 0, padding = 0;
+    uintptr_t object = 0, auxiliary = 0;
+};
+static_assert(sizeof(Value) == 48 && offsetof(Value,type) == 0x18);
+using Get = bool(*)(void*,void*,const char*,Value*,bool);
+using Set = bool(*)(void*,void*,const char*,const Value*,bool);
+// This EXE reads the full qword argument count at entry RSP+0x30.
+// Using unsigned here leaves its upper half undefined on Win64.
+using Invoke = bool(*)(void*,void*,Value*,const char*,const Value*,uint64_t,bool);
+using Release = void(*)(void*,Value*,void*);
+using Attach = bool(*)(void*,void*,Value*,const char*,const char*,int,const void*);
+using Empty = bool(*)(void*,void*,Value*,const char*,int);
+using Retain = void(*)(void*,Value*,void*);
+struct Api {
+    Get get; Set set; Invoke invoke; Release release; Attach attach; Empty empty;
+    void (*trace)(const char* operation,const char* member,bool success) = nullptr;
+    Retain retain = nullptr;
+};
+inline void trace(const Api& api,const char* operation,const char* member,bool success=false) {
+    if (api.trace) api.trace(operation,member,success);
+}
+inline unsigned type(const Value& value) { return value.type & 0x8f; }
+inline bool object(const Value& value) { return value.interfacePointer && value.object && (type(value) == 8 || type(value) == 10); }
+inline void* iface(const Value& v) { return reinterpret_cast<void*>(v.interfacePointer); }
+inline void* data(const Value& v) { return reinterpret_cast<void*>(v.object); }
+inline bool display(const Value& v) { return type(v) == 10; }
+inline Value number(double n) { Value v; v.type = 5; std::memcpy(&v.object,&n,sizeof(n)); return v; }
+inline Value string(const char* s) { Value v; v.type = 6; v.object = reinterpret_cast<uintptr_t>(s); return v; }
+inline Value boolean(bool b) { Value v; v.type = 2; v.object = b; return v; }
+inline bool asNumber(const Value& v,double& n) {
+    switch (type(v)) {
+        case 3:n=static_cast<int32_t>(v.object);return true;
+        case 4:n=static_cast<uint32_t>(v.object);return true;
+        case 5:std::memcpy(&n,&v.object,sizeof(n));return true;
+        default:return false;
+    }
+}
+class Owned {
+    const Api& api;
+public:
+    Value value;
+    explicit Owned(const Api& a):api(a){}
+    Owned(const Owned&) = delete;
+    Owned& operator=(const Owned&) = delete;
+    void reset() {
+        if(value.type&0x40)api.release(iface(value),&value,data(value));
+        value={};
+    }
+    void assignBorrowed(const Value& source) {
+        if(&source==&value)return;
+        reset();
+        value.interfacePointer=source.interfacePointer;value.type=source.type;
+        value.object=source.object;value.auxiliary=source.auxiliary;
+        if(value.type&0x40)api.retain(iface(value),&value,data(value));
+    }
+    ~Owned() {
+        if (value.type & 0x40) {
+            trace(api,"release.begin","");
+            api.release(iface(value),&value,data(value));
+            trace(api,"release.end","",true);
+        }
+    }
+};
+inline bool get(const Api& api,const Value& parent,const char* name,Owned& out) {
+    if (!object(parent)) return false;
+    trace(api,"get.begin",name);
+    const bool okay=api.get(iface(parent),data(parent),name,&out.value,display(parent));
+    trace(api,"get.end",name,okay); return okay;
+}
+inline bool set(const Api& api,const Value& parent,const char* name,const Value& value) {
+    if (!object(parent)) return false;
+    trace(api,"set.begin",name);
+    const bool okay=api.set(iface(parent),data(parent),name,&value,display(parent));
+    trace(api,"set.end",name,okay); return okay;
+}
+inline bool call(const Api& api,const Value& parent,const char* name,const Value* args,uint64_t count,Owned& out) {
+    if (!object(parent)||!api.invoke) return false;
+    trace(api,"invoke.begin",name);
+    const bool okay=api.invoke(iface(parent),data(parent),&out.value,name,args,count,display(parent));
+    trace(api,"invoke.end",name,okay); return okay;
+}
+inline bool attach(const Api& api,const Value& parent,Owned& out,const char* symbol,const char* instance) {
+    trace(api,"attach.begin",symbol);
+    const bool okay=api.attach(iface(parent),data(parent),&out.value,symbol,instance,-1,nullptr);
+    trace(api,"attach.end",symbol,okay); return okay && object(out.value);
+}
+inline bool empty(const Api& api,const Value& parent,Owned& out,const char* instance) {
+    trace(api,"sprite.begin",instance);
+    const bool okay=api.empty(iface(parent),data(parent),&out.value,instance,-1);
+    trace(api,"sprite.end",instance,okay); return okay && object(out.value);
+}
+enum class Stage : unsigned { NoPanel=1,NoBrake,NoPosition,Existing,CreateFailed,BuildFailed,Created };
+inline void fitCaption(const Api& api,const Value& field) {
+    Owned measured(api);double width=0;
+    // Text starts at x=19; the icon starts at x=162. Reserve a 7-unit gap.
+    if(get(api,field,"textWidth",measured)&&asNumber(measured.value,width)&&width>0&&width<4096) {
+        width+=4; // TextField's internal horizontal padding.
+        set(api,field,"width",number(width));
+        set(api,field,"scaleX",number(width>136?136/width:1));
+    }
+}
+// Draw a d-pad left badge: filled left arm/hub, outline up/down/right arms.
+inline bool drawPadLeft(const Api& api,const Value& row) {
+    Owned pad(api),graphics(api);
+    const Value name=string("srAutopilotPad");
+    if(!call(api,row,"getChildByName",&name,1,pad)||!object(pad.value)||
+       !get(api,pad.value,"graphics",graphics)||!object(graphics.value))return false;
+    const auto& g=graphics.value;Value col;col.type=4;col.object=0xd2d5d1;
+    auto gc=[&](const char* method,std::initializer_list<Value> args){
+        Owned r(api);return call(api,g,method,args.begin(),static_cast<uint64_t>(args.size()),r);
+    };
+    auto rect=[&](double x1,double y1,double x2,double y2,bool filled){
+        if(filled&&!gc("beginFill",{col,number(1)}))return false;
+        if(!gc("moveTo",{number(x1),number(y1)}))return false;
+        if(!gc("lineTo",{number(x2),number(y1)}))return false;
+        if(!gc("lineTo",{number(x2),number(y2)}))return false;
+        if(!gc("lineTo",{number(x1),number(y2)}))return false;
+        if(!gc("lineTo",{number(x1),number(y1)}))return false;
+        if(filled&&!gc("endFill",{}))return false;
+        return true;
+    };
+    if(!gc("clear",{})||!gc("lineStyle",{number(2),col,number(1)}))return false;
+    if(!rect(3,11,21,21,true))return false;
+    if(!rect(11,3,21,11,false))return false;
+    if(!rect(11,21,21,29,false))return false;
+    if(!rect(21,11,29,21,false))return false;
+    return set(api,pad.value,"visible",boolean(true));
+}
+struct RowOptions {
+    const char* label = "TEST";
+    double step = 96;
+    void (*created)(const Value& panel,const Value& row) = nullptr;
+    const char* keyLabel = nullptr;
+    bool cruiseIcon = false;
+    bool padIcon = false;
+};
+// Candidate entry point after the game's own brakeBtn read has returned.
+// This is not yet validated in a live driving HUD. Never call from creation.
+// The display list owns the resulting child; no managed reference escapes.
+inline Stage addTestRowToPanel(const Api& api,const Value& panel,const Value& brake,const RowOptions& options = {}) {
+    if (!object(panel)) return Stage::NoPanel;
+    if (!object(brake)) return Stage::NoBrake;
+    // The caller gates this to one attempt per parent. Do not Invoke AS3
+    // methods here: getChildByName did not return in the live v5 test.
+    Owned x(api),y(api);
+    double px=0,py=0;
+    if (!get(api,brake,"x",x) || !get(api,brake,"y",y) ||
+        !asNumber(x.value,px) || !asNumber(y.value,py)) return Stage::NoPosition;
+    // Use the library-backed parent's symbol context. A new built-in Sprite
+    // was created successfully in v6, but could not resolve hudBtnBg.
+    Owned row(api),text(api),tf(api);
+    if (!attach(api,panel,row,"hudBrakeBtn","srAutopilotProbe")) return Stage::CreateFailed;
+    const bool built = set(api,row.value,"x",number(px)) && set(api,row.value,"y",number(py-options.step)) &&
+        set(api,row.value,"mouseEnabled",boolean(false)) && set(api,row.value,"mouseChildren",boolean(false)) &&
+        set(api,row.value,"tabEnabled",boolean(false)) && set(api,row.value,"label",string(options.label)) &&
+        get(api,row.value,"tfCont",text) && object(text.value) &&
+        get(api,text.value,"tf",tf) && object(tf.value) && set(api,tf.value,"text",string(options.label));
+    if (!built) {
+        // Keep a failed child invisible until the HUD destroys its display
+        // list. Avoid removeChild/Invoke on the unverified method-call ABI.
+        set(api,row.value,"visible",boolean(false));
+        return Stage::BuildFailed;
+    }
+    if(options.cruiseIcon)fitCaption(api,tf.value);
+    // The test row has no handbrake action or key binding. Suppress the
+    // inherited brake glyph and key badge instead of suggesting that it does.
+    for (const char* child : {"iconContainer","buttonAttach"}) {
+        Owned decoration(api);
+        if (get(api,row.value,child,decoration) && object(decoration.value))
+            set(api,decoration.value,"visible",boolean(false));
+    }
+    if(options.padIcon) {
+        // Controller badge: own empty sprite in the same key-hint slot as the
+        // native MC_PC keycaps (x=207, y=8, scale .75), then draw a vector
+        // d-pad left glyph so it matches the L/E/Q keycaps in size and place.
+        Owned pad(api);
+        const bool created=empty(api,row.value,pad,"srAutopilotPad")&&
+            set(api,pad.value,"x",number(207))&&set(api,pad.value,"y",number(8))&&
+            set(api,pad.value,"scaleX",number(.75))&&set(api,pad.value,"scaleY",number(.75))&&
+            set(api,pad.value,"mouseEnabled",boolean(false))&&set(api,pad.value,"mouseChildren",boolean(false));
+        if(created)drawPadLeft(api,row.value);
+        trace(api,"padbadge.end","dpad-left",created);
+    } else if(options.keyLabel) {
+        // This authored slot already has x=207, y=8 and scale=.75, matching
+        // the game's brake/AWD/diff key hints. Use the original MC_PC artwork.
+        Owned slot(api),key(api),keyText(api);
+        const bool badge=get(api,row.value,"buttonAttach",slot)&&object(slot.value)&&
+            attach(api,slot.value,key,"MC_PC","srAutopilotKey")&&
+            set(api,key.value,"x",number(0))&&set(api,key.value,"y",number(0))&&
+            get(api,key.value,"textField",keyText)&&object(keyText.value)&&
+            set(api,keyText.value,"text",string(options.keyLabel))&&
+            set(api,slot.value,"visible",boolean(true));
+        if(!badge&&object(slot.value))set(api,slot.value,"visible",boolean(false));
+        trace(api,"keybadge.end",options.keyLabel,badge);
+    }
+    if(options.cruiseIcon) {
+        Owned icon(api);
+        const bool created=empty(api,row.value,icon,"srAutopilotIcon")&&
+            set(api,icon.value,"x",number(162))&&set(api,icon.value,"y",number(4))&&
+            set(api,icon.value,"mouseEnabled",boolean(false))&&set(api,icon.value,"mouseChildren",boolean(false));
+        trace(api,"icon.create.end","speedometer",created);
+    }
+    if (options.created) options.created(panel,row.value);
+    return Stage::Created;
+}
+}

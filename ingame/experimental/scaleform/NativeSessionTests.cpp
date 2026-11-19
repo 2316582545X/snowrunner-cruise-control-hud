@@ -1,0 +1,134 @@
+#include "NativeSession.h"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <unordered_set>
+#include <limits>
+
+namespace {
+unsigned checks=0,sets=0;int references=0;bool hidden=false,offStage=false,cycle=false,failColor=false;
+uintptr_t color=0;bool selected=false;std::string label;
+bool nativeVisible=true,rowVisible=true,missingBrake=false,badAlpha=false,failVisibility=false,selectionShows=false;
+double nativeAlpha=1,rowAlpha=1;
+const char* languageText=nullptr;double measuredWidth=0,fieldWidth=0,fieldScale=0;
+bool readText(const void* from,void* to,size_t size) {
+    if(!languageText)return false;
+    const auto start=reinterpret_cast<uintptr_t>(languageText),address=reinterpret_cast<uintptr_t>(from);
+    const auto length=std::strlen(languageText)+1;
+    if(address<start||address-start>length||size>length-(address-start))return false;
+    std::memcpy(to,from,size);return true;
+}
+std::unordered_set<nativeui::Value*> registered;
+void check(bool b){++checks;if(!b){std::fprintf(stderr,"FAIL session check %u\n",checks);std::exit(1);}}
+nativeui::Value object(uintptr_t id){nativeui::Value v;v.type=0x4a;v.interfacePointer=0x100;v.object=id;return v;}
+void pin(nativeui::Value* out){check(registered.insert(out).second);out->links[0]=reinterpret_cast<uintptr_t>(out);out->links[1]=0x1234;++references;}
+void acquire(nativeui::Value* out,uintptr_t id){*out=object(id);pin(out);}
+bool get(void*,void* parent,const char* name,nativeui::Value* out,bool){
+    const auto id=reinterpret_cast<uintptr_t>(parent);
+    if(!std::strcmp(name,"stage")){if(offStage)out->type=1;else acquire(out,100);return true;}
+    if(!std::strcmp(name,"visible")){*out=nativeui::boolean(id==2?!hidden:id==8?nativeVisible:rowVisible);return true;}
+    if(!std::strcmp(name,"alpha")){if(id==8&&badAlpha)return false;*out=nativeui::number(id==2?1:id==8?nativeAlpha:rowAlpha);return true;}
+    if(!std::strcmp(name,"parent")){if(cycle)acquire(out,id);else out->type=1;return true;}
+    if(!std::strcmp(name,"tfCont")){acquire(out,6);return true;}
+    if(id==6&&!std::strcmp(name,"tf")){acquire(out,7);return true;}
+    if(!std::strcmp(name,"brakeBtn")){if(missingBrake)return false;acquire(out,8);return true;}
+    if(id==7&&!std::strcmp(name,"text")&&languageText){*out=nativeui::string(languageText);return true;}
+    if(id==7&&!std::strcmp(name,"textWidth")&&measuredWidth){*out=nativeui::number(measuredWidth);return true;}
+    return false;
+}
+bool set(void*,void*,const char* name,const nativeui::Value* value,bool){
+    ++sets;
+    if(!std::strcmp(name,"selected")){selected=value->object!=0;if(selectionShows){rowVisible=true;rowAlpha=1;}}
+    if(!std::strcmp(name,"visible")){if(failVisibility)return false;rowVisible=value->object!=0;}
+    if(!std::strcmp(name,"alpha")){if(failVisibility)return false;check(nativeui::asNumber(*value,rowAlpha));}
+    if(!std::strcmp(name,"label"))label=reinterpret_cast<const char*>(value->object);
+    if(!std::strcmp(name,"textColor")){color=value->object;return !failColor;}
+    if(!std::strcmp(name,"width"))check(nativeui::asNumber(*value,fieldWidth));
+    if(!std::strcmp(name,"scaleX"))check(nativeui::asNumber(*value,fieldScale));
+    return true;
+}
+void retain(void* iface,nativeui::Value* value,void* data){check(iface==reinterpret_cast<void*>(0x100)&&data==reinterpret_cast<void*>(value->object));pin(value);}
+void release(void*,nativeui::Value* value,void*){check(value->links[0]==reinterpret_cast<uintptr_t>(value));check(registered.erase(value)==1);--references;check(references>=0);value->links[0]=value->links[1]=UINT64_MAX;}
+}
+int main(){
+    nativeui::Api api{get,set,nullptr,release,nullptr,nullptr,nullptr,retain};
+    nativeui::Session session(api);void* movie=reinterpret_cast<void*>(1);
+    session.add(movie,object(2),object(4));check(references==2&&session.has(movie));
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&!selected&&color==0xd2d5d1&&label=="АВТОПИЛОТ [F6]");
+    const auto oldSets=sets;check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&sets==oldSets&&references==2);
+    check(session.tick(movie,1,"АВТОПИЛОТ [F6]")&&selected&&color==0xd2d5d1&&references==2);
+    nativeVisible=false;
+    // Backslash can hide native buttons while the parent stays visible.
+    // Display changes must not change the driving guard or cruise state.
+    check(session.tick(movie,1,"АВТОПИЛОТ [F6]")&&!rowVisible&&selected&&rowAlpha==1);
+    const auto hiddenSets=sets;
+    check(session.tick(movie,1,"АВТОПИЛОТ [F6]")&&!rowVisible&&sets==hiddenSets);
+    nativeVisible=true;
+    check(session.tick(movie,1,"АВТОПИЛОТ [F6]")&&rowVisible&&selected);
+    nativeAlpha=0;
+    check(session.tick(movie,1,"АВТОПИЛОТ [F6]")&&rowVisible&&rowAlpha==0&&selected);
+    for(double opacity:{.1,.25,.5,.75,1.0}) {
+        nativeAlpha=opacity;
+        check(session.tick(movie,1,"АВТОПИЛОТ [F6]")&&rowAlpha==opacity&&selected);
+    }
+    nativeVisible=false;selectionShows=true;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&!rowVisible&&!selected);
+    selectionShows=false;rowVisible=true; // External writes are corrected too.
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&!rowVisible);
+    nativeVisible=true;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&rowVisible);
+    missingBrake=true;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&!rowVisible&&rowAlpha==0);
+    missingBrake=false;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&rowVisible&&rowAlpha==1);
+    badAlpha=true;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&!rowVisible&&rowAlpha==0);
+    badAlpha=false;nativeAlpha=std::numeric_limits<double>::quiet_NaN();
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&!rowVisible&&rowAlpha==0);
+    nativeAlpha=1;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&rowVisible&&rowAlpha==1);
+    nativeVisible=false;failVisibility=true;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&rowVisible);
+    failVisibility=false;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&!rowVisible);
+    for(unsigned i=0;i<100;++i) {
+        nativeVisible=(i%2)==0;
+        check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&rowVisible==nativeVisible&&references==2);
+    }
+    nativeVisible=true;session.tick(movie,1,"АВТОПИЛОТ [F6]");
+    hidden=true;check(!session.tick(movie,1,"АВТОПИЛОТ [F6]"));hidden=false;
+    offStage=true;check(!session.tick(movie,1,"АВТОПИЛОТ [F6]"));offStage=false;
+    cycle=true;check(!session.tick(movie,1,"АВТОПИЛОТ [F6]")&&references==2);cycle=false;
+    failColor=true;check(!session.tick(movie,2,"АВТОПИЛОТ [F6]"));failColor=false;
+    check(session.tick(movie,0,"АВТОПИЛОТ [F6]")&&references==2);
+    session.drop(movie);check(references==0&&!session.has(movie));
+    const auto afterDrop=sets;check(!session.tick(movie,1,"stale")&&sets==afterDrop);
+    session.add(movie,object(2),object(4));session.add(movie,object(2),object(5));check(references==2);
+    session.drop(movie);check(references==0);
+    for(uintptr_t i=0;i<17;++i)session.add(movie,object(1000+i),object(2000+i));
+    check(references==32);session.drop(movie);check(references==0);
+    check(registered.empty());
+    nativeui::Session localized(api,readText);
+    localized.add(movie,object(2),object(4));
+    languageText="РУЧНОЙ ТОРМОЗ";measuredWidth=120;
+    check(localized.tick(movie,1,"fallback",.01f)&&label=="КРУИЗ КОНТРОЛЬ"&&selected&&color==0xd2d5d1);
+    check(fieldWidth==124&&fieldScale==1);
+    languageText="FREIN À MAIN";measuredWidth=240;
+    check(localized.tick(movie,1,"fallback",.2f)&&label=="КРУИЗ КОНТРОЛЬ");
+    check(localized.tick(movie,1,"fallback",1)&&label=="RÉGULATEUR DE VITESSE"&&selected);
+    check(fieldWidth==244&&fieldScale==136.0/244);
+    languageText=nullptr;
+    check(localized.tick(movie,1,"fallback",1)&&label=="RÉGULATEUR DE VITESSE"&&selected);
+    languageText="UI_HUD_HANDBRAKE_INDICATOR";
+    check(localized.tick(movie,1,"fallback",1)&&label=="RÉGULATEUR DE VITESSE");
+    languageText="HANDBREMSE";measuredWidth=90;
+    check(localized.tick(movie,1,"fallback",1)&&label=="CRUISE CONTROL"&&selected);
+    check(fieldScale==1); // Restore normal width after the longer language.
+    languageText="  Ручной тормоз\n";
+    check(localized.tick(movie,0,"fallback",1)&&label=="КРУИЗ КОНТРОЛЬ"&&!selected);
+    failColor=true;
+    check(!localized.tick(movie,2,"fallback",1));failColor=false;
+    check(localized.tick(movie,2,"fallback",.01f)); // Retry failed UI update.
+    localized.drop(movie);check(registered.empty()&&references==0);
+    std::printf("PASS: %u native session ownership/visibility/state checks\n",checks);
+}

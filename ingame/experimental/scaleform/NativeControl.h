@@ -1,0 +1,128 @@
+#pragma once
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <atomic>
+#include <cstdint>
+#include <string>
+#include <cstdio>
+#include "../../src/CruiseState.h"
+
+namespace nativecontrol {
+// Minimal XInput state (matches XINPUT_STATE/XINPUT_GAMEPAD layout).
+struct XiState { uint32_t packet; uint16_t buttons; uint8_t leftTrigger,rightTrigger;
+    int16_t thumbLX,thumbLY,thumbRX,thumbRY; };
+typedef DWORD (WINAPI *XiGetState)(DWORD, XiState*);
+inline constexpr uint16_t XiDpadLeft=0x0004;
+inline std::atomic<int> state{0};
+inline std::atomic<bool> owns{false},stop{false},manual{false},cancel{false},hudVisible{false};
+inline std::atomic<bool> throttleReleased{false};
+inline autopilot::PhysicalThrottle windowThrottle;
+inline std::atomic<ULONGLONG> hudStamp{0};
+inline unsigned toggleKey=VK_F6;
+inline bool gamepadToggle=true;
+inline uint16_t gamepadButton=XiDpadLeft;
+// Raw last-polled XInput state, captured for diagnostics on a toggle edge.
+inline uint16_t lastPadMask=0;
+inline uint8_t lastPadLT=0,lastPadRT=0;
+inline constexpr ULONG_PTR inputTag=0x53524e41;
+inline HHOOK hook=nullptr;
+inline std::atomic<WNDPROC> previous{nullptr};
+inline HWND gameWindow=nullptr;
+inline void (*notify)(int,const char*)=nullptr;
+inline bool down(unsigned key){return (GetAsyncKeyState(static_cast<int>(key))&0x8000)!=0;}
+inline bool focused(){DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);return pid==GetCurrentProcessId();}
+inline bool modifiers(){return down(VK_CONTROL)||down(VK_SHIFT)||down(VK_MENU)||down(VK_LWIN)||down(VK_RWIN);}
+inline bool available(){const auto now=GetTickCount64(),stamp=hudStamp.load();return hudVisible.load()&&stamp&&now>=stamp&&now-stamp<=500;}
+inline bool send(bool held){INPUT input{};input.type=INPUT_KEYBOARD;input.ki.wScan=0x11;input.ki.dwFlags=KEYEVENTF_SCANCODE|(held?0:KEYEVENTF_KEYUP);input.ki.dwExtraInfo=inputTag;return SendInput(1,&input,sizeof(input))==1;}
+inline autopilot::CruiseState cruise(send);
+inline autopilot::KeyboardPolicy policy(cruise,0);
+inline void publish(const char* reason){owns=cruise.ownsThrottle;const int next=cruise.inputFailed?2:cruise.active?1:0;const int old=state.exchange(next);if(old!=next&&notify)notify(next,reason);}
+inline LRESULT CALLBACK keyboard(int code,WPARAM message,LPARAM data){
+    if(code==HC_ACTION){
+        const auto& key=*reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
+        const bool swallow=policy.handle(key.vkCode,key.scanCode,key.flags,focused(),down(MapVirtualKeyW(0x1f,MAPVK_VSC_TO_VK_EX)),modifiers());
+        if(!(key.flags&(LLKHF_INJECTED|LLKHF_EXTENDED))&&key.scanCode==0x11&&(key.flags&LLKHF_UP)) {
+            // The hook may swallow W-up, so the window tracker must also
+            // forget this hold even when no WM_KEYUP reaches the game.
+            windowThrottle.release();
+            if(cruise.active)throttleReleased=true;
+        }
+        publish("physical input");if(swallow)return 1;
+    }
+    return CallNextHookEx(hook,code,message,data);
+}
+inline LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM vk,LPARAM data){
+    if((message==WM_KEYDOWN||message==WM_SYSKEYDOWN||message==WM_KEYUP||message==WM_SYSKEYUP)&&static_cast<ULONG_PTR>(GetMessageExtraInfo())!=inputTag){
+        const unsigned scan=(static_cast<ULONG_PTR>(data)>>16)&0xff;
+        const bool extended=(static_cast<ULONG_PTR>(data)&(1u<<24))!=0;
+        const bool up=message==WM_KEYUP||message==WM_SYSKEYUP;
+        if(scan==0x11&&!extended) {
+            if(up) {
+                windowThrottle.release();
+                if(state.load()==1){throttleReleased=true;return 0;}
+            }else if(windowThrottle.press())manual=true;
+        }
+        if(!up&&(scan==0x1f||scan==0x31||scan==0x32||vk==VK_ESCAPE||vk==VK_RETURN||vk==VK_F1||vk==VK_F4))cancel=true;
+    }
+    if((message==WM_KEYDOWN||message==WM_KEYUP||message==WM_SYSKEYDOWN||message==WM_SYSKEYUP)&&vk==toggleKey&&!modifiers()&&(state.load()==1||available()))return 0;
+    const auto old=previous.load();return old?CallWindowProcW(old,window,message,vk,data):DefWindowProcW(window,message,vk,data);
+}
+inline BOOL CALLBACK findWindow(HWND window,LPARAM){DWORD pid=0;GetWindowThreadProcessId(window,&pid);if(pid==GetCurrentProcessId()&&IsWindowVisible(window)&&GetWindow(window,GW_OWNER)==nullptr){gameWindow=window;return FALSE;}return TRUE;}
+inline DWORD WINAPI inputThread(void* value){
+    const auto module=static_cast<HMODULE>(value);
+    const bool initialThrottle=down(MapVirtualKeyW(0x11,MAPVK_VSC_TO_VK_EX));
+    policy.resetThrottle(initialThrottle);windowThrottle.reset(initialThrottle);
+    hook=SetWindowsHookExW(WH_KEYBOARD_LL,keyboard,module,0);
+    // Resolve XInput through the same DLL fallback chain the older controller
+    // addon uses. Prefer XInputGetStateEx (ordinal 100), fall back to the
+    // named XInputGetState. Every handle/pointer is guarded before use.
+    HMODULE xiLib=nullptr;
+    static const wchar_t* xiDlls[]={L"xinput1_4.dll",L"xinput1_3.dll",L"xinput1_2.dll",L"xinput1_1.dll",L"xinput9_1_0.dll"};
+    for(const wchar_t* dll:xiDlls){xiLib=LoadLibraryW(dll);if(xiLib)break;}
+    XiGetState xiGet=nullptr;
+    if(xiLib){
+        xiGet=reinterpret_cast<XiGetState>(reinterpret_cast<void*>(GetProcAddress(xiLib,(LPCSTR)100)));
+        if(!xiGet)xiGet=reinterpret_cast<XiGetState>(reinterpret_cast<void*>(GetProcAddress(xiLib,"XInputGetState")));
+    }
+    auto padButton=[&](){
+        if(!xiGet||!gamepadToggle){lastPadMask=0;return false;}
+        XiState xi{};
+        for(DWORD idx=0;idx<4;++idx){
+            if(xiGet(idx,&xi)==ERROR_SUCCESS){
+                lastPadMask=xi.buttons;lastPadLT=xi.leftTrigger;lastPadRT=xi.rightTrigger;
+                return (xi.buttons&gamepadButton)!=0;
+            }
+        }
+        lastPadMask=0;return false;
+    };
+    const bool initialPad=padButton();
+    autopilot::ToggleEdge edge(down(toggleKey)||initialPad);bool lastToggle=down(toggleKey)||initialPad,restoreNextPoll=false;MSG message{};ULONGLONG lastWindow=0;
+    while(!stop.load()){
+        MsgWaitForMultipleObjects(0,nullptr,FALSE,8,QS_ALLINPUT);
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){TranslateMessage(&message);DispatchMessageW(&message);}
+        const auto now=GetTickCount64();
+        if(gameWindow&&!IsWindow(gameWindow)){gameWindow=nullptr;previous=nullptr;}
+        if(!previous.load()&&now-lastWindow>1000){lastWindow=now;EnumWindows(findWindow,0);if(gameWindow){SetLastError(0);const auto old=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gameWindow,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(windowProc)));if(old)previous=old;}}
+        autopilot::CruiseInput input;input.focused=focused();input.drivingHud=available();
+        input.brake=down(MapVirtualKeyW(0x1f,MAPVK_VSC_TO_VK_EX));input.engine=down(MapVirtualKeyW(0x31,MAPVK_VSC_TO_VK_EX));
+        input.cancel=cancel.exchange(false)||down(VK_ESCAPE)||down(VK_RETURN)||down(VK_F1)||down(VK_F4);
+        input.manual=manual.exchange(false);input.toggle=down(toggleKey)||padButton();input.modifiers=modifiers();
+        // Defer one poll so the physical key-up has left the input callback.
+        input.throttleReleased=restoreNextPoll;restoreNextPoll=throttleReleased.exchange(false);
+        const bool pressed=input.toggle&&!lastToggle;lastToggle=input.toggle;const auto oldState=state.load();
+        autopilot::updateCruiseInput(cruise,edge,input);publish("poll");
+        if(pressed&&(lastPadMask&gamepadButton)&&notify){
+            char diag[128];
+            std::snprintf(diag,sizeof(diag),"pad toggle mask=0x%04x lt=%u rt=%u; RB(handbrake)=0x0200",lastPadMask,lastPadLT,lastPadRT);
+            notify(state.load(),diag);
+        }
+        if(input.throttleReleased&&cruise.active&&notify)notify(1,"physical W-up: throttle hold restored");
+        if(pressed&&input.focused&&oldState==state.load()&&notify)
+            notify(state.load(),input.drivingHud?"F-key blocked by brake/modifier/release":"F-key blocked: native HUD unavailable");
+    }
+    cruise.cancel();publish("shutdown");if(hook)UnhookWindowsHookEx(hook);return 0;
+}
+inline void shutdown(){stop=true;if(owns.load())send(false);}
+inline std::string label(){return "CRUISE CONTROL";}
+inline std::string keyLabel(){char key[16]{};std::snprintf(key,sizeof(key),"F%u",toggleKey-VK_F1+1);return key;}
+}
