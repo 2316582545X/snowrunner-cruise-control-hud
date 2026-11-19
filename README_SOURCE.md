@@ -1,6 +1,8 @@
 # SnowRunner CC HUD 1.2.1 — 内存扫描定制版源码包
 
 日期：2026-11-17
+上游项目：https://github.com/TRSteep/SR_CruiseControl/ （本仓库为其 1.2.1 HUD 版的
+本地定制分支，改动见第三节；MinHook 许可随 `ingame/vendor/minhook-1.3.4/LICENSE.txt` 附带）。
 本包为可重编译的源码快照，对应已交付 ASI `2a02594c9003999ccba451a87794604762241c972cc0802f6b24967296a51e31`（897,099 字节）。
 **未改动游戏 EXE**，所有改动都在 mod 自身源码内。
 
