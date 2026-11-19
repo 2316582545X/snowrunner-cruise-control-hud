@@ -15,10 +15,18 @@ typedef DWORD (WINAPI *XiGetState)(DWORD, XiState*);
 inline constexpr uint16_t XiDpadLeft=0x0004;
 inline std::atomic<int> state{0};
 inline std::atomic<bool> owns{false},stop{false},manual{false},cancel{false},hudVisible{false};
+// Runtime master switch: false = mod is fully stepped aside (hooks detached by
+// the probe, no cruise action, no input swallow, HUD hidden). Toggled in-game
+// by the probe's master hotkey (F8 by default); bidirectional.
+inline std::atomic<bool> runtimeActive{true};
 inline std::atomic<bool> throttleReleased{false};
 inline autopilot::PhysicalThrottle windowThrottle;
 inline std::atomic<ULONGLONG> hudStamp{0};
 inline unsigned toggleKey=VK_F6;
+// Runtime master hotkey, wired from the probe's INI (F8=119 default).
+inline unsigned masterKey=VK_F8;
+// Invoked on the master-key edge; installed by the probe to detach/reattach hooks.
+inline void (*onMasterToggle)()=nullptr;
 inline bool gamepadToggle=true;
 inline uint16_t gamepadButton=XiDpadLeft;
 // Raw last-polled XInput state, captured for diagnostics on a toggle edge.
@@ -38,6 +46,7 @@ inline autopilot::CruiseState cruise(send);
 inline autopilot::KeyboardPolicy policy(cruise,0);
 inline void publish(const char* reason){owns=cruise.ownsThrottle;const int next=cruise.inputFailed?2:cruise.active?1:0;const int old=state.exchange(next);if(old!=next&&notify)notify(next,reason);}
 inline LRESULT CALLBACK keyboard(int code,WPARAM message,LPARAM data){
+    if(!runtimeActive.load())return CallNextHookEx(hook,code,message,data);
     if(code==HC_ACTION){
         const auto& key=*reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
         const bool swallow=policy.handle(key.vkCode,key.scanCode,key.flags,focused(),down(MapVirtualKeyW(0x1f,MAPVK_VSC_TO_VK_EX)),modifiers());
@@ -52,6 +61,7 @@ inline LRESULT CALLBACK keyboard(int code,WPARAM message,LPARAM data){
     return CallNextHookEx(hook,code,message,data);
 }
 inline LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM vk,LPARAM data){
+    if(!runtimeActive.load()){const auto old=previous.load();return old?CallWindowProcW(old,window,message,vk,data):DefWindowProcW(window,message,vk,data);}
     if((message==WM_KEYDOWN||message==WM_SYSKEYDOWN||message==WM_KEYUP||message==WM_SYSKEYUP)&&static_cast<ULONG_PTR>(GetMessageExtraInfo())!=inputTag){
         const unsigned scan=(static_cast<ULONG_PTR>(data)>>16)&0xff;
         const bool extended=(static_cast<ULONG_PTR>(data)&(1u<<24))!=0;
@@ -103,6 +113,15 @@ inline DWORD WINAPI inputThread(void* value){
         const auto now=GetTickCount64();
         if(gameWindow&&!IsWindow(gameWindow)){gameWindow=nullptr;previous=nullptr;}
         if(!previous.load()&&now-lastWindow>1000){lastWindow=now;EnumWindows(findWindow,0);if(gameWindow){SetLastError(0);const auto old=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gameWindow,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(windowProc)));if(old)previous=old;}}
+        // Master toggle edge must be polled even while dormant, otherwise F8 could
+        // never re-attach after detach.
+        {
+            const bool masterDown=down(masterKey);
+            static bool lastMaster=false;
+            if(masterDown&&!lastMaster&&onMasterToggle)onMasterToggle();
+            lastMaster=masterDown;
+        }
+        if(!runtimeActive.load())continue;
         autopilot::CruiseInput input;input.focused=focused();input.drivingHud=available();
         input.brake=down(MapVirtualKeyW(0x1f,MAPVK_VSC_TO_VK_EX));input.engine=down(MapVirtualKeyW(0x31,MAPVK_VSC_TO_VK_EX));
         input.cancel=cancel.exchange(false)||down(VK_ESCAPE)||down(VK_RETURN)||down(VK_F1)||down(VK_F4);

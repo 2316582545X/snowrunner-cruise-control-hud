@@ -55,6 +55,8 @@ using Advance=float(*)(void*,float,unsigned,bool);
 using Destroy=uintptr_t(*)(void*,unsigned);
 Advance originalAdvance=nullptr;
 Destroy originalDestroy=nullptr;
+// Resolved hook targets retained for runtime detach/reattach (F8 master key).
+static void *g_tCreate=nullptr,*g_tAttach=nullptr,*g_tGet=nullptr,*g_tAdvance=nullptr,*g_tDestroy=nullptr;
 // Keep the registry allocated until process exit. Normal Movie destruction
 // releases its entries before the VM dies; no C++ global destructor calls it.
 bool read(const void* from,void* to,size_t bytes);
@@ -113,6 +115,26 @@ void controlEvent(int state,const char* reason) {
     Event e{};e.kind=6;e.thread=GetCurrentThreadId();e.type=state;e.success=state==1;
     std::snprintf(e.symbol,sizeof(e.symbol),"CONTROL-%s",state==1?"ON":state==2?"ERROR":"OFF");
     std::snprintf(e.instance,sizeof(e.instance),"%s",reason);publish(e);
+}
+// Runtime master transition: detach every installed observer hook (restore the
+// original prologue bytes via MinHook) or re-attach them. Runs from the probe
+// heartbeat thread on the F8 edge; bidirectional.
+void applyRuntimeActive(bool active,FILE* log){
+    if(nativecontrol::runtimeActive.load()==active)return;
+    if(!active){
+        nativecontrol::cruise.cancel();
+        if(nativecontrol::owns.load())nativecontrol::send(false);
+        nativecontrol::owns=false;
+        nativecontrol::hudVisible=false;
+        nativecontrol::hudStamp=0;
+    }
+    void* targets[5]={g_tCreate,g_tAttach,g_tGet,g_tAdvance,g_tDestroy};
+    for(void* t:targets){
+        if(!t)continue;
+        if(active)MH_EnableHook(t);else MH_DisableHook(t);
+    }
+    nativecontrol::runtimeActive.store(active);
+    if(log){std::fprintf(log,"Runtime master: %s (hooks %s, input/HUD %s)\n",active?"ON":"OFF",active?"enabled":"disabled",active?"active":"dormant");std::fflush(log);}
 }
 void registerRow(const ObservedValue& panel,const ObservedValue& row) {
     void* movie=nullptr;
@@ -415,10 +437,20 @@ DWORD WINAPI run(void*) {
 #else
     const std::wstring configPath=logPath+L"SnowRunnerNativeAutopilot.ini";
 #endif
-    enableTestRow=GetPrivateProfileIntW(L"Autopilot",L"Enabled",1,configPath.c_str())!=0;
+    // Enabled is the master switch: 0 puts the ASI fully dormant (no signature
+    // scan, no MinHook patches, no input thread, no HUD row). Use it to run
+    // alongside the external time-control module. 1 keeps the observer/input/HUD
+    // subsystems; Hooks/InputHook below are finer diagnostic gates.
+    const bool masterEnabled=GetPrivateProfileIntW(L"Autopilot",L"Enabled",1,configPath.c_str())!=0;
+    enableTestRow=masterEnabled;
     nativecontrol::toggleKey=GetPrivateProfileIntW(L"Autopilot",L"ToggleKey",VK_F6,configPath.c_str());
     if(nativecontrol::toggleKey<VK_F2||nativecontrol::toggleKey>VK_F12||nativecontrol::toggleKey==VK_F4)nativecontrol::toggleKey=VK_F6;
     nativecontrol::gamepadToggle=GetPrivateProfileIntW(L"Autopilot",L"GamepadToggle",1,configPath.c_str())!=0;
+    // Runtime master hotkey: detaches/reattaches all observer hooks in-game
+    // without restarting. F8=119 by default; F2-F12 except F4.
+    unsigned masterKey=GetPrivateProfileIntW(L"Autopilot",L"MasterKey",VK_F8,configPath.c_str());
+    if(masterKey<VK_F2||masterKey>VK_F12||masterKey==VK_F4)masterKey=VK_F8;
+    nativecontrol::masterKey=masterKey;
     // InputHook=0 disables the optional input subsystem: no background poll
     // thread, no low-level keyboard hook, no window WndProc subclass, no key
     // injection and no gamepad polling. HUD observer hooks stay installed.
@@ -450,6 +482,13 @@ DWORD WINAPI run(void*) {
     logPath += L"SnowRunnerScaleformProbe.log";
 #endif
     FILE* log = _wfopen(logPath.c_str(), L"w"); if (!log) return 1;
+#ifdef SCALEFORM_NATIVE_AUTOPILOT
+    if(!masterEnabled){
+        std::fprintf(log,"Enabled=0: master switch OFF; mod dormant (no scan, no hooks, no input thread, no HUD row).\n");
+        std::fclose(log);
+        return 0;
+    }
+#endif
     // Install the non-swallowing fault recorder before any hook is installed.
     g_faultLog=log; g_asiModule=module;
     g_exeBase=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
@@ -573,8 +612,11 @@ DWORD WINAPI run(void*) {
         std::fclose(log); return 1;
     }
 #ifdef SCALEFORM_NATIVE_AUTOPILOT
+    g_tCreate=create;g_tAttach=attach;g_tGet=get;g_tAdvance=advance;g_tDestroy=destroy;
     if(enableTestRow&&inputEnabled) {
         nativecontrol::notify=controlEvent;
+        nativecontrol::onMasterToggle=[](){ applyRuntimeActive(!nativecontrol::runtimeActive.load(), g_faultLog); };
+        std::fprintf(log,"Runtime master hotkey vk=%u (F8=119)\n",masterKey);std::fflush(log);
         const auto input=CreateThread(nullptr,0,nativecontrol::inputThread,module,0,nullptr);
         if(input){CloseHandle(input);std::fprintf(log,"Native input thread started.\n");}
         else std::fprintf(log,"Native input thread failed; throttle unavailable.\n");
