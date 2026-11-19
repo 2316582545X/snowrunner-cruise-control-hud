@@ -1,4 +1,4 @@
-# SnowRunner CC HUD 1.2.1 — 内存扫描定制版源码包
+# SnowRunner Cruise Control HUD 1.2.1 — 内存扫描定制版源码包
 
 日期：2026-11-17
 上游项目：https://github.com/TRSteep/SR_CruiseControl/ （本仓库为其 1.2.1 HUD 版的

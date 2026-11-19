@@ -1,6 +1,7 @@
-# SnowRunner CC HUD — memscan custom build
+# SnowRunner Cruise Control HUD — memscan custom build
 
-SnowRunner 巡航控制 HUD 的本地定制分支，基于上游 **[TRSteep/SR_CruiseControl](https://github.com/TRSteep/SR_CruiseControl/)** v1.2.1 HUD 版改造。
+SnowRunner 巡航控制（Cruise Control）HUD 的本地定制分支，基于上游
+**[TRSteep/SR_CruiseControl](https://github.com/TRSteep/SR_CruiseControl/)** v1.2.1 HUD 版改造。
 **不修改游戏 EXE**，只重编译 mod 自身的 ASI。
 
 ## 这是什么
@@ -9,8 +10,8 @@ SnowRunner 巡航控制 HUD 的本地定制分支，基于上游 **[TRSteep/SR_C
 EXE 做特征码扫描，读到密文导致钩子装不上、HUD 不出现。本分支把解析器改为**抓取运行时内存
 镜像快照**做签名定位，在不动游戏文件的前提下让 HUD 挂载成功。
 
-> 功能定位：**定速/自动油门保持**——巡航接通后模拟一直按住油门 `W`。它不像真车 ACC 那样
-> 用雷达测距、自动跟车减速，也不会自动刹车；没有前车距离适应。名称里的 CC = Cruise Control。
+> 功能定位：**定速/自动油门保持**——巡航接通后模拟一直按住油门 `W`。它不像真车自适应巡航
+> （ACC）那样用雷达测距、自动跟车减速，也不会自动刹车；没有前车距离适应。
 
 ## 功能
 
