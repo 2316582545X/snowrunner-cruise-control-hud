@@ -438,9 +438,8 @@ DWORD WINAPI run(void*) {
     const std::wstring configPath=logPath+L"SnowRunnerNativeAutopilot.ini";
 #endif
     // Enabled is the master switch: 0 puts the ASI fully dormant (no signature
-    // scan, no MinHook patches, no input thread, no HUD row). Use it to run
-    // alongside the external time-control module. 1 keeps the observer/input/HUD
-    // subsystems; Hooks/InputHook below are finer diagnostic gates.
+    // scan, no MinHook patches, no input thread, no HUD row). 1 keeps the
+    // observer/input/HUD subsystems; Hooks/InputHook below are finer diagnostic gates.
     const bool masterEnabled=GetPrivateProfileIntW(L"Autopilot",L"Enabled",1,configPath.c_str())!=0;
     enableTestRow=masterEnabled;
     nativecontrol::toggleKey=GetPrivateProfileIntW(L"Autopilot",L"ToggleKey",VK_F6,configPath.c_str());
@@ -458,8 +457,8 @@ DWORD WINAPI run(void*) {
     // Hooks=0 disables every MinHook observer patch (diagnostic: leaves only the
     // fault-recording VEH and the log thread; no game function prologue is rewritten).
     const bool hooksOptedIn=GetPrivateProfileIntW(L"Autopilot",L"Hooks",1,configPath.c_str())!=0;
-    // Per-hook diagnostic toggles (default follow Hooks). Used to binary-search
-    // which observer patch, if any, conflicts with the external time-control module.
+    // Per-hook diagnostic toggles (default follow Hooks). Used to bisect which
+    // observer patch, if any, is involved in a crash report.
     const bool hookCreate=GetPrivateProfileIntW(L"Autopilot",L"HookCreate",hooksOptedIn?1:0,configPath.c_str())!=0;
     const bool hookAttach=GetPrivateProfileIntW(L"Autopilot",L"HookAttach",hooksOptedIn?1:0,configPath.c_str())!=0;
     const bool hookGet=GetPrivateProfileIntW(L"Autopilot",L"HookGet",hooksOptedIn?1:0,configPath.c_str())!=0;

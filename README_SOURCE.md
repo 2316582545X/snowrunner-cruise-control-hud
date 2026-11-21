@@ -63,5 +63,5 @@ ingame/
 - `src/Autopilot.cpp` 是旧的 ImGui 独立叠加层参考代码，本 ASI 构建不编译它；要编译它需另行
   补回 imgui vendor。
 - `installer/`（C# .NET 安装器）与本源码包的 ASI 构建无关，仅随源码留档。
-- 已知未解决问题：与 `SnowRunner_time_control.exe` 同开会崩溃；接通巡航后手刹行橙色高亮
-  待进游戏看日志掩码核实。详见交付 zip 内 `README_MEMSCAN.md`。
+- 已知未解决问题：接通巡航后手刹行橙色高亮，待进游戏看日志掩码核实。详见交付 zip 内
+  `README_MEMSCAN.md`。
